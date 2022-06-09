@@ -1,0 +1,5 @@
+(.*)_Summary	\1
+(.*)_val_1	\1
+(.*)_val_2	\1
+^(.*)_\d_CKDL.*_(\d)$	\1_rep\2
+(.*).Q2.Mapped.Sort	\1

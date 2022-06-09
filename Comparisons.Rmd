@@ -1,0 +1,304 @@
+---
+title: "GZ-14821"
+author: "Alex Rajewski"
+date: "2/3/2022"
+output: html_document
+---
+
+# NOTES
+
+# Set up
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(magrittr)
+  library(viridis)
+  library(cowplot)
+  library(patchwork)
+  library(corrplot)
+  library(GenomicRanges)
+  library(chromVAR)
+  library(ChIPseeker)
+})
+
+### For Mouse
+library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+library(org.Mm.eg.db)
+chroms = c(paste0("chr", seq(1:19)),"chrX","chrY")
+org_DB <- "org.Mm.eg.db"
+assign("txdb",TxDb.Mmusculus.UCSC.mm10.knownGene)
+
+# Create directories
+projPath = "./" 
+project = "results/Diff/"
+dir.create(paste0(projPath, project),
+           showWarnings = F)
+```
+
+## Metadata
+Read in the metadata
+```{r}
+## Path to the project and histone list
+meta <- read_delim("NF_Metadata.tsv", 
+                   show_col_types = F, 
+                   col_names = F,
+                   col_types = "cfffdfccf") %>% 
+  set_colnames(c("Sample","Histone","Sex","Genotype", "Replicate", "FQ1", "FQ2", "CTR_Sample"))
+```
+
+## Consensus Peaks
+First we get a master list of peaks.
+
+```{r message=FALSE, warning=FALSE}
+# read back in?
+masterPeak_anno <- read_csv(paste0(projPath, project,"PeakAnnotation.csv.gz"))
+```
+
+```{r}
+## overlap with bam file to get count
+masterPeak <- map(meta$Sample[meta$Histone!="NA"],
+                  function(samp){
+                    peakRes = read.table(paste0("results/peaks/",samp,"_Control.SEACR.bed"),
+                                         header = FALSE,
+                                         fill = TRUE)
+                    mPeak = GRanges(seqnames = peakRes$V1, 
+                                    IRanges(start = peakRes$V2, end = peakRes$V3),
+                                    strand = "*")
+                    return(mPeak)
+                  }) %>% 
+  purrr::reduce(append) %>% 
+  unique()
+
+# Remove non-standard chromosomes
+masterPeak <- masterPeak[masterPeak@seqnames %in% chroms]
+
+# Annotate
+masterPeak_anno <- annotatePeak(masterPeak,
+                                TxDb = txdb,
+                                level = "gene",
+                                overlap = 'all',
+                                flankDistance = 1000,
+                                sameStrand = TRUE,
+                                annoDb = org_DB,
+                                ignoreDownstream = FALSE,
+                                genomicAnnotationPriority = c("Promoter", "5UTR", "Exon", "3UTR",  "Intron",
+                                                              "Intergenic","Downstream")) %>% 
+  as.GRanges() %>% 
+  {data.frame(PeakID = paste0(seqnames(.),":",
+                                             start(.),"-",
+                                             end(.)),
+                              Chr = seqnames(.),
+                              Start = start(.),
+                              End = end(.),
+                              EntrezID = .$geneId,
+                              Annotation = .$annotation,
+                              ENSEMBLID = .$ENSEMBL,
+                              GeneSymbol = .$SYMBOL,
+                              GeneName = .$GENENAME)} %T>% 
+  write_csv(paste0(project,"PeakAnnotation.csv.gz"))
+```
+
+## Counts
+Then count the fragments in each peak.
+
+```{r}
+# Read back in?
+countMat <- readRDS(paste0(projPath,project,"Counts.RDS"))
+```
+
+```{r}
+countMat <- map(meta$Sample[meta$Histone!="NA"],
+           function(samp){
+             chromVAR::getCounts(paste0("results/align/",samp,".Q2.Sort.MarkDup.bam"),
+                                 masterPeak,
+                                 paired = T,
+                                 by_rg = F,
+                                 format = "bam") %>% 
+               counts()
+           }) %>% 
+  purrr::reduce(cbind) %>% 
+  magrittr::set_colnames(meta$Sample[meta$Histone!="NA"]) %>% 
+  magrittr::set_rownames(paste0(masterPeak@seqnames,":", masterPeak@ranges)) %T>%
+  saveRDS(paste0(project,"Counts.RDS"))
+
+```
+
+# Differential
+
+## Sex difference of H3K27ac
+
+Filter samples of interest and low abundance peaks
+```{r}
+SOI <- meta$Sample[meta$Histone=="K27ac" & meta$Genotype=="WT"]
+countMat_filt <- countMat[which(rowSums(countMat) > 5),SOI]
+```
+
+
+```{r}
+# Run DESeq2
+dds <- DESeq2::DESeqDataSetFromMatrix(countData = countMat_filt,
+                                      colData = data.frame(meta[meta$Sample %in% SOI,c(1:5)]),
+                                      design = ~Sex) %>% 
+  DESeq2::DESeq()
+
+# Get DE Results
+results <- DESeq2::results(dds, 
+                           independentFiltering = F, 
+                           altHypothesis = "greaterAbs")
+
+# Get counts table
+norm <- counts(dds,normalized=T) %>%
+  magrittr::set_colnames(paste0(colnames(countMat_filt),"_Norm"))
+
+```
+
+### Export Table
+```{r}
+# Merge for a pretty table
+Full_Results <- cbind(as.matrix(countMat_filt),norm,results) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("PeakID") %>% 
+  left_join(masterPeak_anno, by = c("PeakID")) %T>%
+  write_csv("Results_WT_K27ac_M_v_F.csv.gz")
+```
+
+
+# Automatic Comparison
+
+## Read in Comparisons
+
+```{r}
+comparisons <- read_csv("Comparisons_New.csv",
+                        show_col_types = F) %>% 
+  rowwise %>% 
+  mutate(Genotype = ifelse(is.na(Genotype),NA,paste0("Genotype",Genotype)),
+         Sex = ifelse(is.na(Sex),NA,paste0("Sex",Sex)),
+         Histone = ifelse(is.na(Histone),NA,paste0("Histone",Histone)),
+         Subset_str = as.character(glue::glue_collapse(na.omit(c(Genotype, Sex, Histone)), sep = " & ")),
+         Genotype=NULL,
+         Sex=NULL, 
+         Histone=NULL) %>% 
+  ungroup()
+```
+
+## Get DE Peaks
+```{r}
+pmap(list(comparisons$Compare[22],
+          comparisons$Name[22],
+          comparisons$Subset_str[22]),
+    function(CompVar,ID,SubsetStr){
+      ######### Subset
+      SOI <- meta %>%
+        dplyr::filter_(SubsetStr) %>%
+        dplyr::filter(!is.na(CTR_Sample)) %>% 
+        dplyr::select(Sample) %>%
+        deframe()
+      countMat_filt <- countMat[which(rowSums(countMat) > 5),SOI]
+      ######### Run DESeq2
+      dds <- DESeq2::DESeqDataSetFromMatrix(countData = countMat_filt,
+                                            colData = data.frame(meta[meta$Sample %in% SOI,c(1:5)]),
+                                            design = as.formula(paste0("~",CompVar))) %>% 
+        DESeq2::DESeq(parallel = TRUE)
+      # Get DE Results
+      results <- DESeq2::results(dds, 
+                                 independentFiltering = F, 
+                                 altHypothesis = "greaterAbs",
+                                 parallel = TRUE)
+      # Get counts table
+      norm <- counts(dds,normalized=T) %>%
+        magrittr::set_colnames(paste0(colnames(countMat_filt),"_Norm"))
+      # Merge for a pretty table
+      Full_Results <- cbind(as.matrix(countMat_filt),norm,results) %>% 
+        as.data.frame() %>% 
+        rownames_to_column("PeakID") %>% 
+        left_join(masterPeak_anno, by = c("PeakID")) %T>%
+        write_csv(paste0(projPath,project, "/Peaks_all_",ID,".csv.gz"))
+      ######### Top DE Peaks
+      # Write results to files based on number of DEGs
+      n_padj0.05 <- Full_Results %>% 
+        dplyr::filter(padj<0.05) %>% 
+        dplyr::count() %>% 
+        deframe()
+      n_padj0.01 <- Full_Results %>% 
+        dplyr::filter(padj<0.01) %>% 
+        dplyr::count() %>% 
+        deframe()
+      if(n_padj0.05 < 20){
+        # Threshold of raw p < 0.05
+        FilterCriteria <- dplyr::quos(pvalue < 0.05)
+        subset_suffix <- "p0.05"
+      } else if(between(n_padj0.05, 20, 200)){
+        # Threshold of adj p < 0.1
+        FilterCriteria <- dplyr::quos(padj < 0.1)
+        subset_suffix <- "padj0.1"
+      } else if(between(n_padj0.05, 200, 2000)) {
+        # Threshold of adj p < 0.05
+        FilterCriteria <- dplyr::quos(padj < 0.05)
+        subset_suffix <- "padj0.05"
+      } else if(n_padj0.05 > 2000 & n_padj0.01 < 2000){
+        # Threshold of adj p < 0.01
+        FilterCriteria <- dplyr::quos(padj < 0.01)
+        subset_suffix <- "padj0.01"
+      } else if(n_padj0.01 >= 2000){
+        # Threshold of adj p < 0.01 and |FC| >= 2
+        FilterCriteria <- dplyr::quos(padj < 0.01,
+                                      abs(log2FoldChange)>2)
+        subset_suffix <- "padj0.01_FC2"
+      } else {
+        stop("\tThere is an error in the gene selection logic.\n\tPlease check the source code.")
+      }
+      results_sig <- Full_Results %>% 
+        filter(!!!FilterCriteria) %>% 
+        write_csv(file=paste0(projPath,project, "/Peaks_",subset_suffix,"_",ID,".csv"))
+      ######### PCA
+      rld <- dds %>% 
+        DESeq2::rlog(blind=T) %>% 
+        SummarizedExperiment::assay()
+      # Select top 500 variable genes
+      TopIndex <- MatrixGenerics::rowVars(rld) %>% 
+        order(decreasing = T) %>% 
+        magrittr::extract(1:500)
+      PCA.data <- rld %>% 
+        magrittr::extract(TopIndex,) %>% 
+        t() %>% 
+        as.data.frame() %>% 
+        mutate(condition=deframe(meta[meta$Sample %in% SOI, CompVar]))
+      # Compute the PCA
+      res.PCA <- FactoMineR::PCA(PCA.data,
+                                 ncp = 5,
+                                 scale.unit = T,
+                                 graph = F,
+                                 quali.sup = ncol(PCA.data))
+      # Plot PCA
+      pdf(paste0(projPath, project,"/PCA_",ID,".pdf"),
+          width=11,
+          height=8)
+      list(c(1,1,1,1,2,2),
+           c(2,2,3,3,3,3),
+           c("all", "none","all", "none","all", "none")) %>% 
+        pmap(function(dim1, dim2, labl){
+          p1 <- FactoMineR::plot.PCA(res.PCA,
+                               axes=c(dim1,dim2),
+                               habillage=ncol(PCA.data),
+                               col.quali = rcartocolor::carto_pal(name="Safe")[1:2],
+                               cex=1,
+                               label = labl,
+                               palette = rcartocolor::carto_pal(name="Safe"),
+                               ggoptions = list(line.lty = 0)) + 
+            cowplot::theme_cowplot() +
+            guides(color=guide_legend(title=CompVar)) +
+            labs(title=paste0("PCA of ", ID ),
+                 caption = paste0("Using top ",ncol(PCA.data)-1, " peaks")) +
+            theme(axis.text = element_blank(),
+                  axis.ticks = element_blank(),
+                  plot.title = element_text(hjust=0.5))
+          print(p1)
+        })
+      dev.off()
+    })
+```
+
+
+
+
